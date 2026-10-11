@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from data import load, stages, stage_mask
+from data import load_cached, stages, stage_mask
 from models import TaskModel
 from fl import build_method, fedavg, ExperienceReplay, EWC
 
@@ -56,18 +56,30 @@ def local_train(model, method, xb_all, yb_all, pb_all, cfg, hist_cells):
             yb = torch.tensor(yb_all[idx])
             pb = torch.tensor(pb_all[idx])
 
-            loss = F.cross_entropy(model(xb), yb)
+            loss_cur = F.cross_entropy(model(xb), yb)
 
             # --- replay -------------------------------------------------
+            # Weight current and replayed losses by how many classes each
+            # covers. Unweighted, a replay budget of 192 against a batch of 32
+            # lets the old classes dominate the gradient 6:1, which trades
+            # catastrophic forgetting for catastrophic *under*-learning of the
+            # new classes. This is the standard DGR/LwF balance.
             rep = method.replay_batch(model, None, hist_cells)
             if rep is not None:
+                n_old = len({c for (_, c) in hist_cells})
+                n_cur = int(len(torch.unique(yb)))
+                tot = max(n_old + n_cur, 1)
+                w_cur, w_rep = n_cur / tot, n_old / tot
                 if isinstance(rep, tuple) and rep and rep[0] == "raw":
                     _, x_rep, y_rep = rep
-                    loss = loss + F.cross_entropy(model(x_rep), y_rep)
+                    loss_rep = F.cross_entropy(model(x_rep), y_rep)
                 else:
                     h_rep, y_rep, _ = rep
-                    loss = loss + F.cross_entropy(
+                    loss_rep = F.cross_entropy(
                         model.forward_features(h_rep), y_rep)
+                loss = w_cur * loss_cur + w_rep * loss_rep
+            else:
+                loss = loss_cur
 
             # --- raw exemplar buffer (ER only) ---------------------------
             if isinstance(method, ExperienceReplay):
@@ -91,7 +103,11 @@ def run(cfg, method_name, log_dir=None, verbose=True):
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
 
-    ds = load(cfg)
+    ds = load_cached(cfg)
+    # Feature width is a property of the dataset, not a constant: GeoLife
+    # gives 7 motion features, NYC gives 6 or 7 depending on schema. Take it
+    # from the data or the first Linear layer is built at the wrong shape.
+    cfg.model.in_dim = int(ds.X.shape[1])
     train_ds, test_ds = ds.split(0.25, cfg.seed)
     sts = stages(ds, cfg.scenario, cfg.seed)
     model = TaskModel(cfg, ds.n_classes)
@@ -130,6 +146,12 @@ def run(cfg, method_name, log_dir=None, verbose=True):
             if states:
                 model.load_state_dict(fedavg(states, weights))
             method.after_round(model, round_idx, hist)
+            # getattr, not direct access: this option post-dates some config
+            # versions, and a missing knob should not crash a run.
+            frz = getattr(cfg.train, "freeze_backbone_after", None)
+            if frz is not None and si >= frz:
+                for q in model.backbone.parameters():
+                    q.requires_grad_(False)
             round_times.append(time.time() - t0)
             round_idx += 1
 

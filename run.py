@@ -35,13 +35,15 @@ from config import Config, ARMS
 import train as trainer
 import mia as mia_mod
 
-BASELINES = ["ewc", "er", "dgr", "ac_gan", "geo_cvae"]
-ABLATION_ARMS = ["geo_cvae_full", "no_geo_conditioning",
+BASELINES = ["ewc", "er", "dgr", "ac_gan", "geo_cvae", "geo_cvae_input"]
+ABLATION_ARMS = ["geo_cvae_input", "no_geo_input",
+                 "geo_cvae_full", "no_geo_conditioning",
                  "no_drift_selective", "no_distillation"]
-MIA_ARMS = ["no_replay", "ewc", "er", "ac_gan", "geo_cvae"]
+MIA_ARMS = ["no_replay", "ewc", "er", "ac_gan", "geo_cvae", "geo_cvae_input"]
 
 PRETTY = {"ewc": "EWC", "er": "Exp. Replay (ER)", "dgr": "DGR (Full GAN)",
-          "ac_gan": "Lightweight AC-GAN", "geo_cvae": "Geo-CVAE"}
+          "ac_gan": "Lightweight AC-GAN", "geo_cvae": "Geo-CVAE (feature)",
+          "geo_cvae_input": "Geo-CVAE (input)", "no_replay": "No replay"}
 
 
 def write_csv(path, rows, header):
@@ -61,6 +63,10 @@ def make_cfg(args, seed):
     cfg.data.dataset = args.dataset
     cfg.data.path = args.data_path
     cfg.out_dir = args.out
+    cfg.data.max_per_cell = args.max_per_cell
+    cfg.data.min_per_cell = args.min_per_cell
+    if args.partitions:
+        cfg.data.n_partitions = args.partitions
     if args.quick:
         cfg.train.rounds_per_stage = 3
         cfg.train.local_epochs = 1
@@ -102,6 +108,11 @@ def exp_ablation(args):
             res, _ = run_one(args, arm, seed)
             write_csv(ap, [[arm, seed, res["aa"], res["bwt"]]],
                       ["arm", "seed", "aa", "bwt"])
+            write_csv(os.path.join(args.out, "ablation_cells.csv"),
+                      [[arm, seed, r["partition"], r["cls"], r["n_users"],
+                        r["acc_first"], r["acc_final"]] for r in res["cells"]],
+                      ["method", "seed", "partition", "cls", "n_users",
+                       "acc_first", "acc_final"])
 
 
 def exp_mia(args):
@@ -151,6 +162,13 @@ def main():
     ap.add_argument("--seeds", type=int, default=5)
     ap.add_argument("--out", default="results")
     ap.add_argument("--mia-n", type=int, default=1500)
+    ap.add_argument("--max-per-cell", type=int, default=None,
+                    help="cap samples per (partition, class) cell. REQUIRED for "
+                         "a full-month NYC file: 12M rows will not train.")
+    ap.add_argument("--min-per-cell", type=int, default=0,
+                    help="drop cells with fewer than this many samples")
+    ap.add_argument("--partitions", type=int, default=None,
+                    help="override the number of geo-partitions")
     ap.add_argument("--quick", action="store_true",
                     help="fewer rounds/clients, for checking the plumbing")
     ap.add_argument("--smoke", action="store_true")

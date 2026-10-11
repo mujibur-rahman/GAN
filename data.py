@@ -249,64 +249,304 @@ def _beijing_cell(lat, lon, n_cells):
     return (r * 5 + c) % n_cells
 
 
+# NYC bounding box, used to drop the (0,0) and out-of-region rows that make up
+# a few percent of every TLC coordinate-era file.
+NYC_BBOX = (40.50, 40.92, -74.27, -73.68)   # lat_min, lat_max, lon_min, lon_max
+JFK_LGA_ZONES = {132, 138}
+
+
 def load_nyc_taxi(cfg):
-    """TLC yellow taxi 2016 Q1. Classes are quantile-binned trip distance;
-    partitions are merged pickup zones; clients are disjoint zone sets."""
+    """TLC yellow taxi. Handles BOTH published schemas.
+
+    The TLC stopped publishing coordinates in July 2016. Files before that
+    (2015, and all of 2016 Q1) carry pickup_longitude / pickup_latitude;
+    files from 2016-07 onward carry PULocationID / DOLocationID instead.
+    The loader detects which and builds partitions accordingly:
+
+      coordinates -> an N x N grid over the NYC bounding box, merged to
+                     n_partitions. Granularity is yours to choose, which is
+                     what makes the partition sweep possible.
+      zone ids    -> the n_partitions busiest zones, rest folded into one.
+
+    Note for Section VI-A: the paper says "263 zones in 6 boroughs" for 2016
+    Q1, but 2016 Q1 predates the zone-id switch, so those files have no zone
+    column. Either the description belongs to a spatial join against the TLC
+    taxi-zone shapefile (which should then be stated), or it should say the
+    partitions come from a coordinate grid.
+    """
     import pandas as pd
     path = cfg.data.path
     if not path or not os.path.exists(path):
         raise FileNotFoundError(
             "NYC taxi data not found. Pass --data-path to a TLC "
-            "yellow_tripdata_2016-0[123] parquet or csv file (or a directory "
-            "of them).")
+            "yellow_tripdata_*.parquet or .csv file, or a directory of them.")
 
-    files = ([os.path.join(path, f) for f in sorted(os.listdir(path))]
-             if os.path.isdir(path) else [path])
+    if os.path.isdir(path):
+        names = sorted(os.listdir(path))
+        # a directory often holds BOTH .csv and .parquet of the same month;
+        # loading both would silently double every trip
+        stems = {}
+        for f in names:
+            if not f.endswith((".csv", ".parquet")):
+                continue
+            stem = f.rsplit(".", 1)[0]
+            # prefer parquet: smaller, typed, much faster
+            if stem not in stems or f.endswith(".parquet"):
+                stems[stem] = f
+        files = [os.path.join(path, f) for f in stems.values()]
+        skipped = len([f for f in names if f.endswith((".csv", ".parquet"))]) - len(files)
+        if skipped:
+            print(f"[nyc] {skipped} duplicate csv/parquet pair(s) skipped; "
+                  f"using parquet")
+    else:
+        files = [path]
+
     frames = []
     for f in files:
         rd = pd.read_parquet if f.endswith(".parquet") else pd.read_csv
         frames.append(rd(f))
+        print(f"[nyc] read {os.path.basename(f)}  ({len(frames[-1]):,} rows)")
     df = pd.concat(frames, ignore_index=True)
-    df.columns = [c.lower() for c in df.columns]
+    df.columns = [c.lower().strip() for c in df.columns]
 
-    need = ["trip_distance", "pulocationid", "dolocationid"]
-    miss = [c for c in need if c not in df.columns]
-    if miss:
-        raise RuntimeError(f"missing columns {miss}; got {list(df.columns)[:12]}")
-    df = df[(df.trip_distance > 0) & (df.trip_distance < 100)].copy()
+    if "trip_distance" not in df.columns:
+        raise RuntimeError(f"no trip_distance column; got {list(df.columns)[:14]}")
 
-    # 4 trip classes: short <2mi, medium 2-6, long 6-15, airport >15 or JFK/LGA
-    AIRPORT = {132, 138}
-    d = df.trip_distance.values
-    cls = np.digitize(d, [2, 6, 15])
-    cls[np.isin(df.pulocationid.values, list(AIRPORT))
-        | np.isin(df.dolocationid.values, list(AIRPORT))] = 3
+    has_coords = {"pickup_latitude", "pickup_longitude"} <= set(df.columns)
+    has_zones = {"pulocationid", "dolocationid"} <= set(df.columns)
+    if not (has_coords or has_zones):
+        raise RuntimeError(
+            "file has neither coordinates nor zone ids. Columns: "
+            f"{list(df.columns)[:14]}")
+    print(f"[nyc] schema: {'coordinates (pre-2016-07)' if has_coords else 'zone ids (2016-07+)'}")
 
-    zones = df.pulocationid.values
-    uz, counts = np.unique(zones, return_counts=True)
-    keep = uz[np.argsort(-counts)][:cfg.data.n_partitions]
-    zmap = {z: i for i, z in enumerate(keep)}
-    part = np.array([zmap.get(z, len(keep) - 1) for z in zones])
+    n0 = len(df)
+    df = df[(df.trip_distance > 0) & (df.trip_distance < 100)]
 
-    feats = np.stack([
-        d, df.get("passenger_count", pd.Series(np.ones(len(df)))).values,
-        df.get("trip_duration", pd.Series(d * 180)).values,
-        zones, df.dolocationid.values,
-        (zones == df.dolocationid.values).astype(float),
-        np.log1p(d),
-    ], 1).astype(np.float32)
+    # trip duration, if the timestamps are there
+    tp = next((c for c in df.columns if "pickup_datetime" in c), None)
+    td = next((c for c in df.columns if "dropoff_datetime" in c), None)
+    if tp and td:
+        dur = (pd.to_datetime(df[td]) - pd.to_datetime(df[tp])).dt.total_seconds()
+        df = df.assign(_dur=dur)
+        df = df[(df._dur > 30) & (df._dur < 4 * 3600)]
+    else:
+        df = df.assign(_dur=df.trip_distance * 180)
 
+    if has_coords:
+        la0, la1, lo0, lo1 = NYC_BBOX
+        df = df[(df.pickup_latitude.between(la0, la1))
+                & (df.pickup_longitude.between(lo0, lo1))
+                & (df.dropoff_latitude.between(la0, la1))
+                & (df.dropoff_longitude.between(lo0, lo1))]
+    df = df.reset_index(drop=True)
+    print(f"[nyc] {n0:,} -> {len(df):,} rows after cleaning "
+          f"({100*(n0-len(df))/max(n0,1):.1f}% dropped)")
+    if len(df) == 0:
+        raise RuntimeError("all rows filtered out; check the file")
+
+    dist = df.trip_distance.values.astype(np.float64)
+
+    # --- partitions -----------------------------------------------------
+    P = cfg.data.n_partitions
+    if has_coords:
+        la0, la1, lo0, lo1 = NYC_BBOX
+        side = int(np.ceil(np.sqrt(P)))
+        r = np.clip(((df.pickup_latitude.values - la0) / (la1 - la0) * side).astype(int), 0, side - 1)
+        c = np.clip(((df.pickup_longitude.values - lo0) / (lo1 - lo0) * side).astype(int), 0, side - 1)
+        raw = r * side + c
+        # keep the P busiest grid cells, fold the long tail into the last one
+        uz, counts = np.unique(raw, return_counts=True)
+        keep = uz[np.argsort(-counts)][:P]
+        zmap = {z: i for i, z in enumerate(keep)}
+        part = np.array([zmap.get(z, len(keep) - 1) for z in raw])
+        n_parts = len(keep)
+        pu_id, do_id = raw.astype(np.float64), np.zeros(len(df))
+        is_airport = np.zeros(len(df), bool)   # no zone ids to test against
+    else:
+        zones = df.pulocationid.values
+        uz, counts = np.unique(zones, return_counts=True)
+        keep = uz[np.argsort(-counts)][:P]
+        zmap = {z: i for i, z in enumerate(keep)}
+        part = np.array([zmap.get(z, len(keep) - 1) for z in zones])
+        n_parts = len(keep)
+        pu_id = zones.astype(np.float64)
+        do_id = df.dolocationid.values.astype(np.float64)
+        is_airport = (np.isin(zones, list(JFK_LGA_ZONES))
+                      | np.isin(df.dolocationid.values, list(JFK_LGA_ZONES)))
+
+    # --- classes: short / medium / long / airport ------------------------
+    cls = np.digitize(dist, [2, 6, 15])
+    if is_airport.any():
+        cls[is_airport] = 3
+    else:
+        # no zone ids: airport trips are the long ones, already class 3
+        pass
+
+    # --- features --------------------------------------------------------
+    # LABEL LEAKAGE: the classes are quantile bins of trip_distance, so
+    # trip_distance, log(distance) and speed (= distance / duration) each
+    # determine the label outright. Including any of them makes the task
+    # trivial -- measured at 99% centralised accuracy, which leaves nothing
+    # for forgetting to destroy and no room for any method to differ.
+    # The features below are the ones an allocator would actually have BEFORE
+    # the trip: where it starts, where it is going, when, and how many riders.
+    dur = df._dur.values.astype(np.float64)
+    pax = df.get("passenger_count", pd.Series(np.ones(len(df)))).values.astype(np.float64)
+    # Time is cyclical: hour 23 sits next to hour 0, and a raw integer tells
+    # the model the opposite. Sin/cos puts them adjacent.
+    if tp:
+        t = pd.to_datetime(df[tp])
+        h = t.dt.hour.values.astype(np.float64)
+        d = t.dt.dayofweek.values.astype(np.float64)
+    else:
+        h = np.zeros(len(df))
+        d = np.zeros(len(df))
+    time_feats = np.stack([np.sin(2 * np.pi * h / 24), np.cos(2 * np.pi * h / 24),
+                           np.sin(2 * np.pi * d / 7), np.cos(2 * np.pi * d / 7)], 1)
+    # DROPOFF AND DURATION ARE ALSO LEAKS. Trip distance is very nearly the
+    # straight-line distance between pickup and dropoff, and duration is
+    # distance divided by a fairly narrow speed band, so either one recovers
+    # the label. Keeping them gave 98.6% centralised accuracy -- a task with
+    # no headroom, where no continual-learning method can show anything.
+    #
+    # Only PRE-TRIP observables are kept: where the request comes from, when,
+    # and how many riders. Predicting the trip-distance class from those is a
+    # genuine allocation problem ("what kind of job is this request?") and is
+    # the SC framing the paper actually argues for -- the platform assigns the
+    # task before the destination is known.
+    if has_coords:
+        geo = np.stack([df.pickup_latitude.values, df.pickup_longitude.values], 1)
+    else:
+        # Zone id is categorical, so a raw integer is a poor input: zone 140 is
+        # not "between" 139 and 141 in any useful sense. Give the model the
+        # zone's centroid-like statistics instead -- its share of pickups and
+        # its mean trip distance -- which are ordinal and carry real signal.
+        # (A learned zone embedding would be better still; that is a change to
+        # the task model, not the loader.)
+        share = pd.Series(pu_id).map(pd.Series(pu_id).value_counts(normalize=True)).values
+        geo = np.stack([pu_id, share], 1)
+    feats = np.concatenate(
+        [geo, time_feats, pax.reshape(-1, 1)], 1).astype(np.float32)
+
+    # --- clients ---------------------------------------------------------
+    # Taxi records carry no driver id, so a "client" is a modelling choice.
+    # One client per partition would make every (partition, class) cell have
+    # exactly one contributing user, which makes the sparse-vs-dense analysis
+    # vacuous -- every cell is "sparse" by construction. Instead each
+    # partition is worked by a VARIABLE number of drivers, so cell occupancy
+    # genuinely varies and the sparse-cell claim becomes testable.
+    # Say in the paper how clients are defined; a reviewer will ask.
     rng = np.random.default_rng(cfg.seed)
-    client = rng.integers(0, cfg.data.n_clients, size=len(df))
-    ds = Dataset(feats, cls, part, client, len(keep), 4, "nyc_taxi")
+    cells = np.unique(part)
+    n_cl = cfg.data.n_clients
+    drivers_per = {z: int(rng.integers(1, max(2, n_cl // max(len(cells), 1) * 2 + 1)))
+                   for z in cells}
+    pool, nxt = {}, 0
+    for z in cells:
+        k = drivers_per[z]
+        pool[z] = [(nxt + i) % n_cl for i in range(k)]
+        nxt += k
+    client = np.array([pool[z][rng.integers(len(pool[z]))] for z in part])
+
+    ds = Dataset(feats, cls, part, client, n_parts, 4, "nyc_taxi")
     ds.X = (ds.X - ds.X.mean(0)) / (ds.X.std(0) + 1e-6)
     return ds
+
+
+def subsample_by_cell(ds, max_per_cell=None, min_per_cell=0, seed=0, verbose=True):
+    """Shrink a dataset by CAPPING each (partition, class) cell, never by
+    sampling the whole set at random.
+
+    This distinction decides whether the paper's sparse-cell analysis survives.
+    Global random sampling scales every cell by the same factor, so a cell with
+    4 samples becomes 1 and a cell with 2 contributing users becomes 1 or 0 --
+    exactly the cells Section VII-A attributes the method's margin to. Capping
+    leaves small cells untouched and only trims the large ones, so the sparse
+    structure is preserved while total size comes down.
+
+    max_per_cell  keep at most this many samples per cell (None = no cap)
+    min_per_cell  drop cells below this many samples; they cannot support a
+                  per-cell accuracy estimate and only add noise to AA and BWT
+    """
+    rng = np.random.default_rng(seed)
+    keep = []
+    dropped_cells = 0
+    # Group once by cell id instead of scanning the whole array per cell.
+    # At 12.6M rows and ~1000 cells the naive form is ~1000 full passes.
+    cell_id = ds.part.astype(np.int64) * ds.n_classes + ds.y.astype(np.int64)
+    order = np.argsort(cell_id, kind="stable")
+    sorted_ids = cell_id[order]
+    bounds = np.flatnonzero(np.r_[True, sorted_ids[1:] != sorted_ids[:-1], True])
+    for b0, b1 in zip(bounds[:-1], bounds[1:]):
+            idx = order[b0:b1]
+            if len(idx) == 0:
+                continue
+            if len(idx) < min_per_cell:
+                dropped_cells += 1
+                continue
+            if max_per_cell is not None and len(idx) > max_per_cell:
+                # keep every contributing client represented before trimming,
+                # so capping cannot silently remove a user from a cell
+                chosen = []
+                for u in np.unique(ds.client[idx]):
+                    ui = idx[ds.client[idx] == u]
+                    take = max(1, int(round(max_per_cell * len(ui) / len(idx))))
+                    chosen.append(rng.choice(ui, min(take, len(ui)), replace=False))
+                idx = np.concatenate(chosen)[:max_per_cell]
+            keep.append(idx)
+    if not keep:
+        raise RuntimeError("subsampling removed everything; lower --min-per-cell")
+    keep = np.sort(np.concatenate(keep))
+    out = Dataset(ds.X[keep], ds.y[keep], ds.part[keep], ds.client[keep],
+                  ds.n_partitions, ds.n_classes, ds.name)
+    if verbose:
+        print(f"[subsample] {len(ds):,} -> {len(out):,} samples "
+              f"({100*len(out)/len(ds):.0f}%)"
+              + (f", dropped {dropped_cells} cells under {min_per_cell} samples"
+                 if dropped_cells else ""))
+    return out
 
 
 def load(cfg):
     return {"synthetic": lambda: make_synthetic(cfg, cfg.seed),
             "geolife": lambda: load_geolife(cfg),
             "nyc_taxi": lambda: load_nyc_taxi(cfg)}[cfg.data.dataset]()
+
+
+def cache_file(cfg):
+    return os.path.join(cfg.out_dir, f"{cfg.data.dataset}_cache.npz")
+
+
+def load_cached(cfg, verbose=False):
+    """Load via an on-disk cache, then apply subsampling.
+
+    Extraction is per-dataset, but a sweep runs the same dataset 70+ times.
+    Re-parsing a 12M-row parquet on every run costs more than the training
+    does, so the raw extraction is cached once and every later run reads the
+    .npz. Subsampling is applied AFTER the cache, so changing --max-per-cell
+    does not force a re-extract.
+    """
+    cp = cache_file(cfg)
+    if os.path.exists(cp):
+        z = np.load(cp, allow_pickle=True)
+        ds = Dataset(z["X"], z["y"], z["part"], z["client"],
+                     int(z["n_partitions"]), int(z["n_classes"]), str(z["name"]))
+        if verbose:
+            print(f"[cache] {cp}  ({len(ds):,} samples)")
+    else:
+        ds = load(cfg)
+        os.makedirs(os.path.dirname(cp) or ".", exist_ok=True)
+        np.savez_compressed(cp, X=ds.X, y=ds.y, part=ds.part, client=ds.client,
+                            n_partitions=ds.n_partitions,
+                            n_classes=ds.n_classes, name=ds.name)
+        print(f"[cache] wrote {cp}  ({len(ds):,} samples) -- later runs reuse this")
+
+    mx = getattr(cfg.data, "max_per_cell", None)
+    mn = getattr(cfg.data, "min_per_cell", 0)
+    if mx or mn:
+        ds = subsample_by_cell(ds, mx, mn, seed=0, verbose=verbose)
+    return ds
 
 
 # ------------------------------------------------------------------ scenarios
@@ -320,25 +560,32 @@ def stages(ds, scenario, seed=0):
     """
     rng = np.random.default_rng(seed)
     K, P = ds.n_classes, ds.n_partitions
-    cls_stages = ([c for c in CIL_STAGES if all(x < K for x in c)]
-                  if K >= 7 else [list(s) for s in np.array_split(np.arange(K), 3)])
+    # At least two classes per stage. A single-class stage is degenerate:
+    # during it the model can reach 100% by predicting that one class, so the
+    # forgetting curve measures the collapse rather than the method. With
+    # K=4 (NYC) that means 2 stages, not 3; with K=7 (GeoLife), 3.
+    n_stages = max(2, min(3, K // 2))
+    if K >= 7:
+        cls_stages = [c for c in CIL_STAGES if all(x < K for x in c)]
+    else:
+        cls_stages = [sorted(s.tolist())
+                      for s in np.array_split(np.arange(K), n_stages)]
+    n_stages = len(cls_stages)
     perm = rng.permutation(P)
-    part_stages = [np.sort(s).tolist() for s in np.array_split(perm, 3)]
+    part_stages = [np.sort(s).tolist() for s in np.array_split(perm, n_stages)]
 
     all_c, all_p = list(range(K)), list(range(P))
     if scenario == "cil":
-        return [(cls_stages[i], all_p) for i in range(3)]
+        return [(cls_stages[i], all_p) for i in range(n_stages)]
     if scenario == "gil":
-        cum = []
-        out = []
-        for i in range(3):
+        cum, out = [], []
+        for i in range(n_stages):
             cum = cum + part_stages[i]
             out.append((all_c, sorted(cum)))
         return out
     if scenario == "cgil":
-        cum = []
-        out = []
-        for i in range(3):
+        cum, out = [], []
+        for i in range(n_stages):
             cum = cum + part_stages[i]
             out.append((cls_stages[i], sorted(cum)))
         return out

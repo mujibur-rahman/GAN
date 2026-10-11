@@ -208,6 +208,12 @@ def main():
     ap.add_argument("--scenario", default="cgil")
     ap.add_argument("--sparse-threshold", type=int, default=3)
     ap.add_argument("--rebuild", action="store_true", help="ignore the cache")
+    ap.add_argument("--max-per-cell", type=int, default=None,
+                    help="cap samples per (partition, class) cell. Use this to "
+                         "shrink a large set -- NOT a global random sample, "
+                         "which destroys sparse cells.")
+    ap.add_argument("--min-per-cell", type=int, default=0,
+                    help="drop cells with fewer than this many samples")
     args = ap.parse_args()
 
     cfg = Config()
@@ -231,6 +237,10 @@ def main():
                   "directory layout the loader expects.")
             sys.exit(1)
         save_cache(ds, cp)
+
+    if args.max_per_cell or args.min_per_cell:
+        print()
+        ds = D.subsample_by_cell(ds, args.max_per_cell, args.min_per_cell, seed=0)
 
     report_basic(ds)
     acc = report_learnable(ds)

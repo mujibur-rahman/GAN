@@ -49,6 +49,14 @@ class TrainConfig:
     drift_eps: float = 1e-3         # epsilon, prevents zero allocation
     drift_update_every: int = 1     # rounds between drift-score refreshes
 
+    # Freeze the backbone after this stage index (0 = after the first stage).
+    # REMIND, which this method's feature replay comes from, keeps the feature
+    # extractor fixed after base initialisation ("theta_G is no longer
+    # plastic"). Feature replay is only valid while the feature space it was
+    # fitted to still exists; if the backbone keeps moving, replayed features
+    # describe a space the classifier has left. None = never freeze.
+    freeze_backbone_after: int = None
+
     # AC-GAN baseline
     acgan_d_steps: int = 1
     acgan_lr_ratio: float = 0.5     # D lr = lr_gen * ratio
@@ -67,6 +75,10 @@ class DataConfig:
     n_classes: int = 7
     sparse_frac: float = 0.40       # share of cells with < 3 contributing users
     samples_per_user: int = 220
+    # Subsampling, applied after the cache. Cap per (partition, class) cell --
+    # never a global random sample, which destroys sparse cells.
+    max_per_cell: int = None
+    min_per_cell: int = 0
 
 
 @dataclass

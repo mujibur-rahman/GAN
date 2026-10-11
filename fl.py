@@ -81,7 +81,7 @@ class DriftTracker:
         self.tau_last[cell] = round_idx
 
     @torch.no_grad()
-    def update(self, model, generator, cells, round_idx):
+    def update(self, model, generator, cells, round_idx, raw_space=False):
         """Refresh delta_{p,c} for historical cells.
 
         The current posterior is computed on GENERATED features, since the
@@ -99,7 +99,10 @@ class DriftTracker:
             ct = torch.full((48,), c, dtype=torch.long)
             h = generator.sample(pt, ct) if hasattr(generator, "sample") \
                 else generator.generate(pt, ct)
-            probs = F.softmax(model.forward_features(h), -1).mean(0).numpy()
+            # An input-space generator emits x, which must traverse the whole
+            # network; a feature-space one emits h, which enters at the head.
+            logits = model(h) if raw_space else model.forward_features(h)
+            probs = F.softmax(logits, -1).mean(0).numpy()
             self.score[(p, c)] = self.div(probs, self.hist[(p, c)])
         model.train()
 
@@ -294,7 +297,8 @@ class GeoCVAEReplay(Method):
         return h, ct, pt
 
     def after_round(self, model, round_idx, hist_cells):
-        self.drift.update(model, self.generator, hist_cells, round_idx)
+        self.drift.update(model, self.generator, hist_cells, round_idx,
+                          raw_space=getattr(self, "raw_space", False))
         self.prev_backbone = copy.deepcopy(model.backbone).eval()
         for q in self.prev_backbone.parameters():
             q.requires_grad_(False)
@@ -441,7 +445,72 @@ class DGRReplay(Method):
         self.generator.load_state_dict(st)
 
 
+class GeoCVAEInputReplay(GeoCVAEReplay):
+    """Geo-conditioned CVAE replay in INPUT space rather than feature space.
+
+    For GeoLife the input is a 7-d motion vector and the penultimate feature
+    is 32-d, so "move replay into feature space to make the generator small"
+    inverts here: the feature space is 4.6x LARGER than the input space.
+    Replaying inputs gives a SMALLER generator and, decisively, removes the
+    backbone-drift failure entirely -- input space does not move when the
+    backbone trains, so a sample generated at stage 1 is still valid at
+    stage 3. Geo-conditioning is unchanged; only the space being modelled
+    differs.
+    """
+    name = "geo_cvae_input"
+    raw_space = True
+
+    def __init__(self, cfg, ds, geo_cond=True, drift_sel=True, distil=True):
+        import copy as _copy
+        cfg2 = _copy.deepcopy(cfg)
+        cfg2.model.feat_dim = cfg.model.in_dim      # model x, not h
+        super().__init__(cfg2, ds, geo_cond, drift_sel, distil)
+        self.cfg = cfg
+
+    def train_generator(self, model, xb, yb, pb):
+        """Fit the CVAE to raw inputs. No feature extraction, so no drift."""
+        h = xb
+        p_all, c_all, h_all = pb, yb, h
+        if self.prev_gen is not None and self.hist_cells:
+            n = min(len(xb), self.cfg.train.replay_budget)
+            sel = [self.hist_cells[i] for i in
+                   np.random.randint(0, len(self.hist_cells), n)]
+            pp = torch.tensor([p for p, _ in sel], dtype=torch.long)
+            cc = torch.tensor([c for _, c in sel], dtype=torch.long)
+            with torch.no_grad():
+                x_old = self.prev_gen.sample(pp, cc)
+            h_all = torch.cat([h, x_old], 0)
+            p_all = torch.cat([pb, pp], 0)
+            c_all = torch.cat([yb, cc], 0)
+        loss, rec, kl = self.generator.loss(h_all, p_all, c_all)
+        self.opt.zero_grad()
+        (self.cfg.train.lambda_r * loss).backward()
+        self.opt.step()
+        return float(rec)
+
+    def replay_batch(self, model, client_cells, hist_cells):
+        """Returns INPUTS, so they pass through the whole network."""
+        alloc = self.drift.allocate(hist_cells, self.cfg.train.replay_budget,
+                                    selective=self.drift_sel)
+        if not alloc:
+            return None
+        ps, cs = [], []
+        for (p, c), n in alloc.items():
+            ps += [p] * n
+            cs += [c] * n
+        if not ps:
+            return None
+        pt = torch.tensor(ps, dtype=torch.long)
+        ct = torch.tensor(cs, dtype=torch.long)
+        x = self.generator.sample(pt, ct)
+        return ("raw", x, ct)
+
+
 def build_method(name, cfg, ds):
+    if name == "geo_cvae_input":
+        return GeoCVAEInputReplay(cfg, ds)
+    if name == "no_geo_input":
+        return GeoCVAEInputReplay(cfg, ds, geo_cond=False)
     if name == "ewc":
         return EWC(cfg, ds)
     if name == "er":
