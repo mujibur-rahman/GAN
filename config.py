@@ -68,8 +68,8 @@ class TrainConfig:
 
 @dataclass
 class DataConfig:
-    dataset: str = "synthetic"      # synthetic | geolife | nyc_taxi
-    path: str = ""                  # required for geolife / nyc_taxi
+    dataset: str = "synthetic"      # synthetic | geolife | nyc_taxi | yelp
+    path: str = ""                  # required for geolife / nyc_taxi / yelp
     n_clients: int = 73             # GeoLife labelled users
     n_partitions: int = 18          # merged ring-road cells
     n_classes: int = 7
@@ -79,6 +79,16 @@ class DataConfig:
     # never a global random sample, which destroys sparse cells.
     max_per_cell: int = None
     min_per_cell: int = 0
+
+    # Yelp only. yelp_dims sets the target input width: the loader keeps the
+    # (yelp_dims - 6) most frequent non-leaky business attributes and adds six
+    # location/rating/time features. 96 puts the input well above feat_dim=32,
+    # which is the condition the mobility datasets cannot test -- there,
+    # input-space replay is both cheaper and more stable, so the two effects
+    # are confounded. yelp_max_reviews caps the review stream; the full file is
+    # ~7M lines and parsing all of it is not needed to fill 73 workers.
+    yelp_dims: int = 96
+    yelp_max_reviews: int = 400_000
 
 
 @dataclass

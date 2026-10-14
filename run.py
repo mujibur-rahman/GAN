@@ -36,9 +36,12 @@ import train as trainer
 import mia as mia_mod
 
 BASELINES = ["ewc", "er", "dgr", "ac_gan", "geo_cvae", "geo_cvae_input"]
-ABLATION_ARMS = ["geo_cvae_input", "no_geo_input",
-                 "geo_cvae_full", "no_geo_conditioning",
-                 "no_drift_selective", "no_distillation"]
+# Component ablation of the INPUT-space method, one switch off per arm.
+# The feature-space arms are kept only for the geo-conditioning cross-check;
+# ablating anything else there is uninformative because that method retains
+# 0.00% regardless of which component is active.
+ABLATION_ARMS = ["abl_full", "abl_no_geo", "abl_no_drift", "abl_no_distil",
+                 "abl_no_selfreplay", "abl_no_balance"]
 MIA_ARMS = ["no_replay", "ewc", "er", "ac_gan", "geo_cvae", "geo_cvae_input"]
 
 PRETTY = {"ewc": "EWC", "er": "Exp. Replay (ER)", "dgr": "DGR (Full GAN)",
@@ -67,6 +70,14 @@ def make_cfg(args, seed):
     cfg.data.min_per_cell = args.min_per_cell
     if args.partitions:
         cfg.data.n_partitions = args.partitions
+    if args.feat_dim:
+        cfg.model.feat_dim = args.feat_dim
+    if args.replay_budget:
+        cfg.train.replay_budget = args.replay_budget
+    if args.yelp_dims:
+        cfg.data.yelp_dims = args.yelp_dims
+    if args.yelp_max_reviews:
+        cfg.data.yelp_max_reviews = args.yelp_max_reviews
     if args.quick:
         cfg.train.rounds_per_stage = 3
         cfg.train.local_epochs = 1
@@ -87,9 +98,10 @@ def run_one(args, method, seed, pretty=None):
 def exp_main(args):
     """E3: every baseline across seeds -> seeds.csv + cells.csv (Table I)."""
     sp, cp = os.path.join(args.out, "seeds.csv"), os.path.join(args.out, "cells.csv")
+    methods = args.methods.split(",") if args.methods else BASELINES
     for seed in range(args.seeds):
-        for m in BASELINES:
-            res, _ = run_one(args, m, seed, PRETTY[m])
+        for m in methods:
+            res, _ = run_one(args, m, seed, PRETTY.get(m, m))
             write_csv(sp, [[res["label"], seed, res["aa"], res["bwt"]]],
                       ["method", "seed", "aa", "bwt"])
             write_csv(cp, [[res["label"], seed, r["partition"], r["cls"],
@@ -156,7 +168,8 @@ def main():
     ap.add_argument("--experiment", choices=["main", "ablation", "mia", "all"],
                     default="all")
     ap.add_argument("--scenario", choices=["cil", "gil", "cgil"], default="cgil")
-    ap.add_argument("--dataset", choices=["synthetic", "geolife", "nyc_taxi"],
+    ap.add_argument("--dataset",
+                    choices=["synthetic", "geolife", "nyc_taxi", "yelp"],
                     default="synthetic")
     ap.add_argument("--data-path", default="")
     ap.add_argument("--seeds", type=int, default=5)
@@ -169,6 +182,28 @@ def main():
                     help="drop cells with fewer than this many samples")
     ap.add_argument("--partitions", type=int, default=None,
                     help="override the number of geo-partitions")
+    ap.add_argument("--feat-dim", type=int, default=None,
+                    help="penultimate feature width (default 32). Lower it to "
+                         "make feature-space replay the CHEAPER option: at 4 "
+                         "on GeoLife the feature generator is 2,316 params "
+                         "against 2,439 for the input-space one, which "
+                         "separates stability from parameter cost.")
+    ap.add_argument("--replay-budget", type=int, default=None,
+                    help="R, generated samples per client per round (default "
+                         "192). Input-space replay passes these through the "
+                         "backbone, so R sets the stability/plasticity balance "
+                         "against a batch of 32 real samples.")
+    ap.add_argument("--methods", default=None,
+                    help="comma-separated arms to run instead of all six "
+                         "baselines, e.g. --methods no_replay. Use this for "
+                         "controls: if no_replay matches a replay method to 4 "
+                         "decimals, that method's replay is a no-op.")
+    ap.add_argument("--yelp-dims", type=int, default=None,
+                    help="Yelp input width (default 96). Above feat_dim=32 the "
+                         "feature space is the compact one, which is the point "
+                         "of this dataset.")
+    ap.add_argument("--yelp-max-reviews", type=int, default=None,
+                    help="cap on reviews streamed from the Yelp review file")
     ap.add_argument("--quick", action="store_true",
                     help="fewer rounds/clients, for checking the plumbing")
     ap.add_argument("--smoke", action="store_true")

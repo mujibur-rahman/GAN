@@ -1,0 +1,21 @@
+method,seed,aa,bwt
+Geo-CVAE (feature),0,25.212,-0.34747
+Geo-CVAE (input),0,32.935,-0.07173
+Lightweight AC-GAN,0,24.57,-0.34783
+No replay,0,23.699,-0.34937
+Geo-CVAE (feature),1,29.471,-0.28889
+Geo-CVAE (input),1,28.479,-0.03925
+Lightweight AC-GAN,1,26.15,-0.28889
+No replay,1,25.889,-0.28889
+Geo-CVAE (feature),2,22.858,-0.3154
+Geo-CVAE (input),2,33.332,-0.017
+Lightweight AC-GAN,2,24.032,-0.32961
+No replay,2,21.959,-0.32961
+Geo-CVAE (feature),3,26.171,-0.33247
+Geo-CVAE (input),3,34.019,-0.10908
+Lightweight AC-GAN,3,26.161,-0.36381
+No replay,3,27.14,-0.35752
+Geo-CVAE (feature),4,26.473,-0.30576
+Geo-CVAE (input),4,37.069,-0.02261
+Lightweight AC-GAN,4,27.107,-0.30942
+No replay,4,26.157,-0.30733

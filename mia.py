@@ -38,13 +38,20 @@ def task_model_scores(model, X, y):
 
 
 @torch.no_grad()
-def cvae_recon_scores(model, generator, X, y, part, draws=8):
+def cvae_recon_scores(model, generator, X, y, part, draws=8, raw_space=False):
     """Reconstruction gap against the CVAE decoder.
 
     Needs the feature extractor, both CVAE paths, and the candidate's (p, c)
     label -- a conditional decoder cannot reconstruct without its condition.
     Averaged over `draws` latent samples, since z is stochastic.
     Members reconstruct better (lower error), so the score is negated.
+
+    `raw_space` selects what the decoder is asked to reconstruct. A
+    feature-space CVAE was fitted to the 32-d penultimate feature, so the
+    candidate must be passed through the backbone first. An input-space CVAE
+    was fitted to the raw observation itself, so x goes in unchanged -- and
+    the attack it exposes is correspondingly different in kind, since what
+    leaks is the observation rather than an embedding of it.
     """
     model.eval()
     generator.eval()
@@ -53,7 +60,7 @@ def cvae_recon_scores(model, generator, X, y, part, draws=8):
         xb = torch.tensor(X[i:i + 512])
         yb = torch.tensor(y[i:i + 512])
         pb = torch.tensor(part[i:i + 512])
-        h = model.features(xb)
+        h = xb if raw_space else model.features(xb)
         err = generator.recon_error(h, pb, yb, draws=draws)
         out.append((-err).numpy())
     model.train()
@@ -117,9 +124,10 @@ def evaluate(result, n=1500, seed=0):
     # --- family: specific ----------------------------------------------
     gen = getattr(method, "generator", None)
     if gen is not None and hasattr(gen, "recon_error"):
+        rs = bool(getattr(method, "raw_space", False))
         emit("recon_gap", "specific",
-             cvae_recon_scores(model, gen, mx, my, mp),
-             cvae_recon_scores(model, gen, nx, ny, np_))
+             cvae_recon_scores(model, gen, mx, my, mp, raw_space=rs),
+             cvae_recon_scores(model, gen, nx, ny, np_, raw_space=rs))
     elif gen is not None and hasattr(gen, "d_score"):
         emit("d_score", "specific",
              acgan_d_scores(model, gen, mx), acgan_d_scores(model, gen, nx))

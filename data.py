@@ -508,14 +508,198 @@ def subsample_by_cell(ds, max_per_cell=None, min_per_cell=0, seed=0, verbose=Tru
     return out
 
 
+
+# ---------------------------------------------------------------------- yelp
+
+# Top-level task categories. Yelp businesses carry a free-text category list;
+# these collapse it to a workable label space of the same order as GeoLife's.
+YELP_CATEGORIES = [
+    "Restaurants", "Shopping", "Food", "Beauty & Spas",
+    "Health & Medical", "Home Services", "Nightlife",
+]
+
+
+def load_yelp(cfg):
+    """Yelp Open Dataset as a spatial crowdsourcing task-allocation problem.
+
+    The SC mapping: a Yelp user is a worker, a business is a task sited at a
+    location, and the task class is the business's top-level category. The
+    platform's job is the same as in the mobility datasets -- decide what kind
+    of task suits a worker in a region -- but the data is reviews rather than
+    trajectories, which is the point of including it.
+
+    WHY THIS DATASET IS HERE. GeoLife (7-d) and NYC (6-d) both have inputs
+    SMALLER than the 32-d penultimate feature, so input-space replay is the
+    cheaper option as well as the stable one, and the two advantages are
+    confounded. Yelp is given a high-dimensional feature vector (business
+    attribute indicators plus location and time, typically 80--150 dims) so
+    that the feature space is the COMPACT one. If feature-space replay still
+    fails here, representation drift dominates regardless of dimensionality;
+    if it wins, we have located the boundary of the claim. Either result is
+    worth reporting, which is why `--yelp-dims` is exposed rather than fixed.
+
+    LABEL LEAKAGE. The category is the label, so any attribute that names it
+    is excluded: keys containing 'Restaurant', 'Food', 'Alcohol', 'Dietary',
+    'Ambience', 'Cuisine' or 'Meal' are dropped. What remains (parking, wifi,
+    wheelchair access, price range, hours) correlates with category without
+    determining it, which is what makes this a prediction task rather than a
+    lookup.
+
+    Expects the Yelp Open Dataset JSON files in one directory:
+        yelp_academic_dataset_business.json
+        yelp_academic_dataset_review.json
+    """
+    import json
+    import pandas as pd
+
+    root = cfg.data.path
+    if not root or not os.path.isdir(root):
+        raise FileNotFoundError(
+            "Yelp data not found. Download the Yelp Open Dataset, extract the "
+            "JSON files, and pass --data-path <dir> containing "
+            "yelp_academic_dataset_business.json and ..._review.json")
+
+    bfile = next((os.path.join(root, f) for f in os.listdir(root)
+                  if "business" in f and f.endswith(".json")), None)
+    rfile = next((os.path.join(root, f) for f in os.listdir(root)
+                  if "review" in f and f.endswith(".json")), None)
+    if not bfile or not rfile:
+        raise FileNotFoundError(
+            f"need a business and a review json in {root}; found "
+            f"{os.listdir(root)[:6]}")
+
+    # --- businesses: small enough to read whole ---------------------------
+    biz = {}
+    with open(bfile, encoding="utf-8") as fh:
+        for line in fh:
+            b = json.loads(line)
+            cats = b.get("categories") or ""
+            label = next((i for i, c in enumerate(YELP_CATEGORIES)
+                          if c.split(" & ")[0] in cats), None)
+            if label is None or b.get("latitude") is None:
+                continue
+            biz[b["business_id"]] = {
+                "y": label,
+                "lat": float(b["latitude"]), "lon": float(b["longitude"]),
+                "city": (b.get("city") or "?").strip().lower(),
+                "stars": float(b.get("stars") or 3.5),
+                "n_rev": float(b.get("review_count") or 1),
+                "attrs": b.get("attributes") or {},
+            }
+    if not biz:
+        raise RuntimeError("no usable businesses parsed")
+    print(f"[yelp] {len(biz):,} businesses with a usable category")
+
+    # --- attribute vocabulary, leakage-filtered ---------------------------
+    BAN = ("restaurant", "food", "alcohol", "dietary", "ambience",
+           "cuisine", "meal", "bestnights", "happyhour")
+    counts = {}
+    for b in biz.values():
+        for k in b["attrs"]:
+            if not any(w in k.lower() for w in BAN):
+                counts[k] = counts.get(k, 0) + 1
+    want = max(0, int(getattr(cfg.data, "yelp_dims", 96)) - 6)
+    attr_keys = [k for k, _ in sorted(counts.items(), key=lambda kv: -kv[1])[:want]]
+    print(f"[yelp] {len(attr_keys)} attribute features kept "
+          f"({len(counts)-len(attr_keys)} dropped as leaky or rare)")
+
+    # --- reviews: streamed, capped ----------------------------------------
+    cap = int(getattr(cfg.data, "yelp_max_reviews", 400_000))
+    rows = []
+    with open(rfile, encoding="utf-8") as fh:
+        for line in fh:
+            if len(rows) >= cap:
+                break
+            r = json.loads(line)
+            b = biz.get(r.get("business_id"))
+            if b is None:
+                continue
+            rows.append((r["user_id"], b, r.get("date", "")))
+    if not rows:
+        raise RuntimeError("no reviews matched a usable business")
+    print(f"[yelp] {len(rows):,} reviews joined to a business")
+
+    # --- clients: the most active reviewers -------------------------------
+    from collections import Counter
+    uc = Counter(u for u, _, _ in rows)
+    keep_users = {u for u, n in uc.most_common(cfg.data.n_clients) if n >= 5}
+    rows = [r for r in rows if r[0] in keep_users]
+    umap = {u: i for i, u in enumerate(sorted(keep_users))}
+    print(f"[yelp] {len(umap)} workers (users) with >=5 reviews, "
+          f"{len(rows):,} samples")
+    if not rows:
+        raise RuntimeError("no users met the minimum review count")
+
+    # --- partitions: busiest cities, rest folded in -----------------------
+    ccount = Counter(b["city"] for _, b, _ in rows)
+    top = [c for c, _ in ccount.most_common(cfg.data.n_partitions)]
+    cmap = {c: i for i, c in enumerate(top)}
+
+    X, y, part, client = [], [], [], []
+    for uid, b, date in rows:
+        a = b["attrs"]
+        vec = [1.0 if str(a.get(k, "False")).lower() not in ("false", "none", "")
+               else 0.0 for k in attr_keys]
+        try:
+            t = pd.Timestamp(date)
+            h, d = t.hour, t.dayofweek
+        except Exception:
+            h, d = 12, 3
+        vec += [b["lat"], b["lon"], b["stars"], np.log1p(b["n_rev"]),
+                np.sin(2 * np.pi * h / 24), np.sin(2 * np.pi * d / 7)]
+        X.append(vec)
+        y.append(b["y"])
+        part.append(cmap.get(b["city"], len(top) - 1))
+        client.append(umap[uid])
+
+    ds = Dataset(np.array(X, np.float32), np.array(y), np.array(part),
+                 np.array(client), len(top), len(YELP_CATEGORIES), "yelp")
+    ds.X = (ds.X - ds.X.mean(0)) / (ds.X.std(0) + 1e-6)
+    print(f"[yelp] feature dimension {ds.X.shape[1]} "
+          f"(penultimate feature is {cfg.model.feat_dim}; "
+          f"{'INPUT larger -- feature-space replay is the compact option' if ds.X.shape[1] > cfg.model.feat_dim else 'input smaller, as in the mobility sets'})")
+    return ds
+
+
 def load(cfg):
     return {"synthetic": lambda: make_synthetic(cfg, cfg.seed),
             "geolife": lambda: load_geolife(cfg),
-            "nyc_taxi": lambda: load_nyc_taxi(cfg)}[cfg.data.dataset]()
+            "nyc_taxi": lambda: load_nyc_taxi(cfg),
+            "yelp": lambda: load_yelp(cfg)}[cfg.data.dataset]()
 
 
-def cache_file(cfg):
-    return os.path.join(cfg.out_dir, f"{cfg.data.dataset}_cache.npz")
+def cache_file(cfg, subsampled=False):
+    """Cache path. The subsampled view gets its own file.
+
+    A full NYC month is ~12.6M rows (~350 MB on disk). Re-loading that for
+    every run of a 30-run sweep, only to cap it to 100k, costs more than the
+    training does. The capped view is therefore cached under its own key, so
+    the big file is read exactly once.
+    """
+    name = cfg.data.dataset
+    if name == "yelp":
+        # The input width and the review cap both change what gets extracted,
+        # so they belong in the key of the raw cache, not only the capped view.
+        name += (f"_d{getattr(cfg.data, 'yelp_dims', 96)}"
+                 f"_r{getattr(cfg.data, 'yelp_max_reviews', 400_000)}")
+    if subsampled:
+        mx = getattr(cfg.data, "max_per_cell", None)
+        mn = getattr(cfg.data, "min_per_cell", 0)
+        name += f"_p{cfg.data.n_partitions}_max{mx}_min{mn}"
+    return os.path.join(cfg.out_dir, f"{name}_cache.npz")
+
+
+def _save(ds, path):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    np.savez_compressed(path, X=ds.X, y=ds.y, part=ds.part, client=ds.client,
+                        n_partitions=ds.n_partitions, n_classes=ds.n_classes,
+                        name=ds.name)
+
+
+def _load(path):
+    z = np.load(path, allow_pickle=True)
+    return Dataset(z["X"], z["y"], z["part"], z["client"],
+                   int(z["n_partitions"]), int(z["n_classes"]), str(z["name"]))
 
 
 def load_cached(cfg, verbose=False):
@@ -527,25 +711,34 @@ def load_cached(cfg, verbose=False):
     .npz. Subsampling is applied AFTER the cache, so changing --max-per-cell
     does not force a re-extract.
     """
-    cp = cache_file(cfg)
-    if os.path.exists(cp):
-        z = np.load(cp, allow_pickle=True)
-        ds = Dataset(z["X"], z["y"], z["part"], z["client"],
-                     int(z["n_partitions"]), int(z["n_classes"]), str(z["name"]))
-        if verbose:
-            print(f"[cache] {cp}  ({len(ds):,} samples)")
-    else:
-        ds = load(cfg)
-        os.makedirs(os.path.dirname(cp) or ".", exist_ok=True)
-        np.savez_compressed(cp, X=ds.X, y=ds.y, part=ds.part, client=ds.client,
-                            n_partitions=ds.n_partitions,
-                            n_classes=ds.n_classes, name=ds.name)
-        print(f"[cache] wrote {cp}  ({len(ds):,} samples) -- later runs reuse this")
-
     mx = getattr(cfg.data, "max_per_cell", None)
     mn = getattr(cfg.data, "min_per_cell", 0)
-    if mx or mn:
-        ds = subsample_by_cell(ds, mx, mn, seed=0, verbose=verbose)
+    want_sub = bool(mx or mn)
+
+    # the capped view, if one was already built for exactly these settings
+    if want_sub:
+        sp = cache_file(cfg, subsampled=True)
+        if os.path.exists(sp):
+            ds = _load(sp)
+            if verbose:
+                print(f"[cache] {os.path.basename(sp)}  ({len(ds):,} samples)")
+            return ds
+
+    cp = cache_file(cfg)
+    if os.path.exists(cp):
+        ds = _load(cp)
+        if verbose:
+            print(f"[cache] {os.path.basename(cp)}  ({len(ds):,} samples)")
+    else:
+        ds = load(cfg)
+        _save(ds, cp)
+        print(f"[cache] wrote {cp}  ({len(ds):,} samples) -- later runs reuse this")
+
+    if want_sub:
+        ds = subsample_by_cell(ds, mx, mn, seed=0, verbose=True)
+        _save(ds, sp)
+        print(f"[cache] wrote capped view {os.path.basename(sp)} "
+              f"({len(ds):,} samples) -- later runs read this instead")
     return ds
 
 

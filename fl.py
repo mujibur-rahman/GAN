@@ -222,9 +222,17 @@ class GeoCVAEReplay(Method):
     name = "geo_cvae"
     has_generator = True
 
-    def __init__(self, cfg, ds, geo_cond=True, drift_sel=True, distil=True):
+    def __init__(self, cfg, ds, geo_cond=True, drift_sel=True, distil=True,
+                 self_replay=True, balanced=True):
         super().__init__(cfg, ds)
         self.geo_cond, self.drift_sel, self.distil = geo_cond, drift_sel, distil
+        # self_replay: the generator rehearses its own prior-stage output
+        #   (scholar-student). Off, it is only ever fitted to the current
+        #   stage and forgets historical cells as fast as the task model.
+        # balanced: class-proportion weighting of current vs replayed loss in
+        #   train.local_train. Off, the two are summed unweighted and the
+        #   replay batch (R=192) outvotes the current batch (32).
+        self.self_replay, self.balanced = self_replay, balanced
         self.generator = GeoCVAE(cfg, ds.n_partitions, ds.n_classes, geo_cond)
         self.opt = torch.optim.Adam(self.generator.parameters(), lr=cfg.train.lr_gen)
         self.drift = DriftTracker(ds.n_partitions, ds.n_classes, cfg)
@@ -254,7 +262,7 @@ class GeoCVAEReplay(Method):
             h = model.features(xb)
         p_all, c_all, h_all = pb, yb, h
 
-        if self.prev_gen is not None and self.hist_cells:
+        if self.self_replay and self.prev_gen is not None and self.hist_cells:
             n = min(len(xb), self.cfg.train.replay_budget)
             sel = [self.hist_cells[i] for i in
                    np.random.randint(0, len(self.hist_cells), n)]
@@ -460,18 +468,20 @@ class GeoCVAEInputReplay(GeoCVAEReplay):
     name = "geo_cvae_input"
     raw_space = True
 
-    def __init__(self, cfg, ds, geo_cond=True, drift_sel=True, distil=True):
+    def __init__(self, cfg, ds, geo_cond=True, drift_sel=True, distil=True,
+                 self_replay=True, balanced=True):
         import copy as _copy
         cfg2 = _copy.deepcopy(cfg)
         cfg2.model.feat_dim = cfg.model.in_dim      # model x, not h
-        super().__init__(cfg2, ds, geo_cond, drift_sel, distil)
+        super().__init__(cfg2, ds, geo_cond, drift_sel, distil,
+                         self_replay, balanced)
         self.cfg = cfg
 
     def train_generator(self, model, xb, yb, pb):
         """Fit the CVAE to raw inputs. No feature extraction, so no drift."""
         h = xb
         p_all, c_all, h_all = pb, yb, h
-        if self.prev_gen is not None and self.hist_cells:
+        if self.self_replay and self.prev_gen is not None and self.hist_cells:
             n = min(len(xb), self.cfg.train.replay_budget)
             sel = [self.hist_cells[i] for i in
                    np.random.randint(0, len(self.hist_cells), n)]
@@ -511,6 +521,21 @@ def build_method(name, cfg, ds):
         return GeoCVAEInputReplay(cfg, ds)
     if name == "no_geo_input":
         return GeoCVAEInputReplay(cfg, ds, geo_cond=False)
+    # Component ablation, run on the input-space arm. Ablating components of
+    # the feature-space arm is uninformative: it retains 0.00% whatever is
+    # switched off, so every row would read the same.
+    if name == "abl_full":
+        return GeoCVAEInputReplay(cfg, ds)
+    if name == "abl_no_geo":
+        return GeoCVAEInputReplay(cfg, ds, geo_cond=False)
+    if name == "abl_no_drift":
+        return GeoCVAEInputReplay(cfg, ds, drift_sel=False)
+    if name == "abl_no_distil":
+        return GeoCVAEInputReplay(cfg, ds, distil=False)
+    if name == "abl_no_selfreplay":
+        return GeoCVAEInputReplay(cfg, ds, self_replay=False)
+    if name == "abl_no_balance":
+        return GeoCVAEInputReplay(cfg, ds, balanced=False)
     if name == "ewc":
         return EWC(cfg, ds)
     if name == "er":

@@ -66,10 +66,15 @@ def local_train(model, method, xb_all, yb_all, pb_all, cfg, hist_cells):
             # new classes. This is the standard DGR/LwF balance.
             rep = method.replay_batch(model, None, hist_cells)
             if rep is not None:
-                n_old = len({c for (_, c) in hist_cells})
-                n_cur = int(len(torch.unique(yb)))
-                tot = max(n_old + n_cur, 1)
-                w_cur, w_rep = n_cur / tot, n_old / tot
+                if getattr(method, "balanced", True):
+                    n_old = len({c for (_, c) in hist_cells})
+                    n_cur = int(len(torch.unique(yb)))
+                    tot = max(n_old + n_cur, 1)
+                    w_cur, w_rep = n_cur / tot, n_old / tot
+                else:
+                    # ablation: sum the two losses unweighted, so a replay
+                    # batch of R=192 outvotes a current batch of 32
+                    w_cur = w_rep = 1.0
                 if isinstance(rep, tuple) and rep and rep[0] == "raw":
                     _, x_rep, y_rep = rep
                     loss_rep = F.cross_entropy(model(x_rep), y_rep)
