@@ -1,12 +1,13 @@
 # Geo-CVAE experiment pipeline
 
 Runnable implementation of the VTC paper's method and baselines, wired to the
-analysis scripts in `../exp/` so every table is one command.
+analysis scripts so every table is one command.
 
 ## Start here
 
 ```bash
 pip install --break-system-packages torch          # numpy/scipy/sklearn assumed
+clone-repo
 cd geocvae
 python3 run.py --smoke                             # ~30 s, checks everything runs
 python3 run.py --experiment all --seeds 5          # the Tier-1 set
@@ -15,7 +16,7 @@ python3 run.py --experiment all --seeds 5          # the Tier-1 set
 `--smoke` also prints the parameter accounting and asserts the Geo-CVAE comes
 to 3,464 parameters, the figure already in Table I.
 
-Synthetic data is the default so the pipeline runs with no download. **Numbers
+Synthetic data is the default, so the pipeline runs with no download. **Numbers
 from synthetic data verify the plumbing and belong nowhere near the paper.**
 For real runs:
 
