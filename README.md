@@ -1,111 +1,265 @@
-# Geo-CVAE experiment pipeline
+# Representation drift in federated spatial crowdsourcing
 
-Runnable implementation of the VTC paper's method and baselines, wired to the
-analysis scripts so every table is one command.
+Code for *"Catastrophic Forgetting Survives Feature Replay: Representation
+Drift in Federated Spatial Crowdsourcing."*
 
-## Start here
+The paper's claim is that **generative replay in the task model's penultimate
+feature space retains nothing under federated continual learning** — not
+degraded retention, zero — because the backbone keeps training and a feature
+synthesised at round *t−1* describes a space the round-*t* classifier has left.
+Moving the same conditional VAE into input space fixes it on two of three
+datasets. This repository reproduces every number in the paper.
+
+Everything runs on CPU. The full set of experiments is a few hours; the
+30-second check below needs no data at all.
+
+---
+
+## 1. Clone and check it runs
 
 ```bash
-pip install --break-system-packages torch          # numpy/scipy/sklearn assumed
-clone-repo
+git clone <this-repo> && cd <this-repo>
+pip install -r requirements.txt
+
 cd geocvae
-python3 run.py --smoke                             # ~30 s, checks everything runs
-python3 run.py --experiment all --seeds 5          # the Tier-1 set
+python3 run.py --smoke
 ```
 
-`--smoke` also prints the parameter accounting and asserts the Geo-CVAE comes
-to 3,464 parameters, the figure already in Table I.
+`--smoke` trains every method on generated data for a few rounds and prints the
+parameter accounting, asserting that the Geo-CVAE comes to 3,464 parameters —
+the figure in the paper. If that line says MISMATCH, stop: the model
+dimensions in `config.py` have drifted from the manuscript.
 
-Synthetic data is the default, so the pipeline runs with no download. **Numbers
-from synthetic data verify the plumbing and belong nowhere near the paper.**
-For real runs:
+> **Synthetic data verifies the plumbing and nothing else.** It is the default
+> so the repo runs with no download, and every run on it prints a warning. No
+> number from a synthetic run belongs in a paper.
+
+---
+
+## 2. Layout
+
+```
+geocvae/            the experiment
+  config.py         every hyperparameter, single source of truth
+  data.py           dataset loaders, caching, per-cell subsampling
+  models.py         task model, Geo-CVAE, AC-GAN, raw DGR
+  fl.py             FedAvg, drift tracking, all methods and ablation arms
+  train.py          stages -> federated rounds -> per-cell evaluation
+  run.py            CLI; one command per experiment
+  build_dataset.py  extract + validate a dataset before you train on it
+  mia.py            membership-inference attacks
+  DATASETS.md       where to download each dataset and the layout expected
+
+exp/                analysis; reads the CSVs run.py writes
+  analyze.py        seeds / cells / partition / retention / ablation
+  retention_sd.py   retention with the spread across seeds
+  fairness_test.py  per-seed spatial dispersion test
+  mia_eval.py       MIA AUC with bootstrap intervals
+  param_scaling.py  generator size against P and K
+```
+
+Results are CSVs under whatever `--out` you pass. **Use a fresh `--out` per
+experiment** — the writers append, so reusing a directory silently mixes runs
+together. This bit us once: a crashed NYC run left rows that made a later
+GeoLife analysis report 11 seeds and 52 partitions for an 18-partition dataset.
+
+---
+
+## 3. Get the data
+
+Full download instructions and the directory layout each loader expects are in
+`geocvae/DATASETS.md`. Always run `build_dataset.py` before `run.py`: it caches
+the extraction and tells you whether the set can answer the question you are
+asking, which is cheaper than finding out after five seeds.
 
 ```bash
-python3 run.py --experiment all --seeds 5 \
-    --dataset geolife --data-path /path/to/Geolife\ Trajectories\ 1.3
+cd geocvae
+
+# GeoLife — the primary dataset (~300 MB)
+python3 build_dataset.py --dataset geolife \
+        --data-path "~/data/Geolife Trajectories 1.3" --partitions 18
+
+# NYC Yellow Taxi — one month of trips, parquet or csv (~350 MB)
+python3 build_dataset.py --dataset nyc_taxi --data-path ~/data/tlc/ \
+        --partitions 18 --max-per-cell 1388 --min-per-cell 20
+
+# Yelp Open Dataset — business + review JSON (~5 GB extracted)
+python3 build_dataset.py --dataset yelp --data-path ~/data/yelp/ \
+        --yelp-max-reviews 7000000 --feat-dim 8 \
+        --partitions 18 --min-per-cell 20
 ```
 
-## What maps to which experiment
+Three things to check in that output before committing to a sweep:
 
-| Command | Experiment | Produces |
+| Dataset | Check | Expected |
 |---|---|---|
-| `--experiment main` | E3 baselines across seeds | `seeds.csv`, `cells.csv` → Table I |
-| `--experiment ablation` | E1 geo-conditioning, E2 drift-selective | `ablation.csv` → ablation table |
-| `--experiment mia` | E6 common attack + no-replay control | `scores.csv` → MIA table |
-| `cells.csv` reanalysis | E4 sparse/dense, E5 per-partition | no extra training |
+| GeoLife | samples | ~9,250 over 73 clients |
+| NYC | schema line | `zone ids` or `coordinates` — both are handled |
+| Yelp | samples, cells | **≥15,000** samples, **≥60** occupied cells |
 
-Then:
+The Yelp thresholds matter. Streaming only part of the review file starves the
+per-worker counts: 400k reviews gives 4,388 samples over 12–17 cells, which is
+too few for any statistic to resolve. The whole file (`7000000`) gives 63,370
+samples over ~52 cells per seed.
+
+---
+
+## 4. Reproduce the paper
+
+Run these from `geocvae/`. Times are for a 4-core laptop CPU.
+
+### Table II — GeoLife main comparison (~25 min)
 
 ```bash
-python3 analyze.py seeds     results/seeds.csv    --out tab_main.tex
-python3 analyze.py cells     results/cells.csv    --out tab_sparse.tex
-python3 analyze.py partition results/cells.csv    --out tab_part.tex
-python3 analyze.py ablation  results/ablation.csv --out tab_abl.tex
-python3 mia_eval.py          results/scores.csv   --out tab_mia.tex --flip recon_gap
+python3 run.py --experiment main --dataset geolife \
+        --data-path ~/data/geolife/ --seeds 5 --out r_main
+python3 ../exp/analyze.py seeds     r_main/seeds.csv
+python3 ../exp/analyze.py retention r_main/cells.csv --old-classes 0,1,2,3
 ```
 
-## Hyperparameters
+### Table III — retention on all three datasets
 
-`config.py` is the single source of truth and closes the manuscript's open
-TODOs: `beta`, `d_z`, `d_g`, `d_k`, `lambda_r`, `lambda_d`, the divergence `D`,
-`epsilon` and the replay budget `R`. Fill Section IV from this file, not the
-other way round. `cfg.summary()` prints the line to paste.
+GeoLife as above, plus:
 
-The CVAE dimensions (`d_hidden=20, d_z=10, d_g=16, d_k=12`) are the one
-configuration that reproduces 3,464 parameters at P=18, K=7, d_feat=32.
+```bash
+# Yelp at d_h = 8, where the input is 3.9x the feature space (~20 min)
+python3 run.py --experiment main --dataset yelp --data-path ~/data/yelp/ \
+        --yelp-max-reviews 7000000 --feat-dim 8 \
+        --partitions 18 --min-per-cell 20 --seeds 5 --out r_yelp_d8
 
-## Four implementation points that differ from the submitted draft
+# NYC (~6 h; the 12.7M-row parse is cached after the first seed)
+python3 run.py --experiment main --dataset nyc_taxi --data-path ~/data/tlc/ \
+        --partitions 18 --max-per-cell 1388 --min-per-cell 20 \
+        --seeds 5 --out r_nyc
 
-These came out of the manuscript review and are worth carrying back into the
-text, because the draft as written describes something that cannot run.
-
-**1. `L_distil` is computed on the current real batch.** The draft summed it
-over the replay batch, which holds features and no inputs, so `f_phi(x)` was
-not computable. See `GeoCVAEReplay.local_extra_loss`.
-
-**2. The penultimate feature is pre-activation.** With a trailing ReLU on the
-backbone, real features on this data are ~94% exact zeros. A Gaussian decoder
-under MSE cannot represent that point mass, so sampled features land
-off-manifold and actively corrupt the classifier head they are replayed into.
-Measured: with the ReLU, replay *reduced* accuracy from 34.4% to 19.1% and the
-model collapsed to one class. Removing it flipped replay to a gain. If the real
-implementation has a post-activation penultimate layer, this is probably the
-first thing to check.
-
-**3. The generator needs self-replay.** Training the CVAE only on current-stage
-features makes it forget historical cells as fast as the task model does, so
-replay injects wrong features. Each generator is now snapshotted at stage end
-and rehearsed against (`end_stage`), which is DGR's scholar–student scheme. The
-AC-GAN baseline gets the same treatment so the comparison is between generator
-families, not between one that rehearses and one that does not.
-
-**4. The no-geo ablation zeroes the embedding; it does not remove it.**
-`GeoCVAE.cond` substitutes a zero vector of the same width when
-`geo_cond=False`, so parameter count and input dimensions are unchanged.
-Dropping the columns would confound "no geo information" with "smaller model".
-
-## Honest limitation in the drift signal
-
-`DriftTracker.update` estimates the current posterior for a historical cell by
-running the model over features **generated for that cell**, since no real data
-for it exists at round *t*. The signal therefore tracks the classifier relative
-to the generator and is blind to the decoder degrading on its own. That is
-Limitation 2 in the paper, and it is real, not a modelling convenience.
-
-## Layout
-
-```
-config.py    every hyperparameter; ARMS defines the ablation variants
-data.py      synthetic generator, GeoLife + NYC loaders, C-IL/G-IL/CG-IL splits
-models.py    TaskModel, GeoCVAE, FeatureACGAN, RawDGR, report_sizes()
-fl.py        FedAvg, DriftTracker, and the five methods
-train.py     stage loop, per-cell evaluation, tau_first / tau_last
-mia.py       common-family and generator-specific attacks
-run.py       CLI
+python3 ../exp/analyze.py retention r_yelp_d8/cells.csv --old-classes 0,1,2,3
+python3 ../exp/analyze.py retention r_nyc/cells.csv     --old-classes 0,1
 ```
 
-## Cost
+### The no-replay control
 
-On 2 CPU cores, one CG-IL run at 73 clients is roughly 1.5 s/round × 45 rounds
-≈ 1 min. The full Tier-1 set at 5 seeds is a few hours. Real GeoLife will be
-slower in feature extraction (cached after the first load) but similar to training.
+The headline result is that feature-space replay lands on plain FedAvg, so the
+control is not optional:
+
+```bash
+python3 run.py --experiment main --methods no_replay --dataset geolife \
+        --data-path ~/data/geolife/ --seeds 5 --out r_main_ctl
+python3 ../exp/analyze.py retention r_main_ctl/cells.csv --old-classes 0,1,2,3
+```
+
+### Feature-width control — rules out cost and capacity (~20 min)
+
+At `--feat-dim 4` the feature-space generator (2,316 params) is *cheaper* than
+the input-space one (2,439) and still retains nothing:
+
+```bash
+for D in 32 8 4; do
+  python3 run.py --experiment main --dataset geolife \
+          --data-path ~/data/geolife/ \
+          --methods geo_cvae,geo_cvae_input,ac_gan,no_replay \
+          --feat-dim $D --seeds 5 --out r_gl_d$D
+  python3 ../exp/analyze.py retention r_gl_d$D/cells.csv --old-classes 0,1,2,3
+done
+```
+
+### Figure 1 — replay-budget sweep on NYC (~1 h)
+
+```bash
+for R in 32 64 128; do
+  python3 run.py --experiment main --dataset nyc_taxi --data-path ~/data/tlc/ \
+          --methods geo_cvae_input --replay-budget $R \
+          --partitions 18 --max-per-cell 1388 --min-per-cell 20 \
+          --seeds 3 --out r_nyc_R$R
+  python3 ../exp/analyze.py retention r_nyc_R$R/cells.csv --old-classes 0,1
+done
+cd .. && python3 fig_budget.py        # edit DATA at the top if budgets differ
+```
+
+### Table IV — component ablation (~50 min for both)
+
+```bash
+python3 run.py --experiment ablation --dataset geolife \
+        --data-path ~/data/geolife/ --seeds 5 --out r_abl_gl
+python3 run.py --experiment ablation --dataset yelp --data-path ~/data/yelp/ \
+        --yelp-max-reviews 7000000 --feat-dim 8 \
+        --partitions 18 --min-per-cell 20 --seeds 5 --out r_abl_yelp
+
+python3 ../exp/analyze.py ablation     r_abl_gl/ablation.csv --full abl_full
+python3 ../exp/retention_sd.py r_abl_gl/ablation_cells.csv \
+        --old-classes 0,1,2,3 --vs abl_full
+```
+
+The six arms switch off one component each: `abl_full`, `abl_no_geo`,
+`abl_no_drift`, `abl_no_distil`, `abl_no_selfreplay`, `abl_no_balance`. They
+run on the **input-space** method deliberately — ablating the feature-space arm
+is uninformative, since it retains 0.00% whichever component is active.
+
+### Spatial fairness and membership inference
+
+```bash
+python3 ../exp/fairness_test.py r_yelp_d8/cells.csv \
+        --a "Geo-CVAE (input)" --b "Lightweight AC-GAN"
+
+python3 run.py --experiment mia --dataset geolife \
+        --data-path ~/data/geolife/ --seeds 3 --out r_mia
+python3 ../exp/mia_eval.py r_mia/scores.csv
+```
+
+Use `fairness_test.py`, not `analyze.py partition`, for any dispersion claim:
+`partition` pools seeds before taking the standard deviation, which understates
+the variance and inflates apparent differences. Two claims in an early draft
+did not survive the per-seed test.
+
+---
+
+## 5. Flags you will actually use
+
+| Flag | What it does |
+|---|---|
+| `--methods a,b` | run specific arms instead of all baselines |
+| `--feat-dim N` | penultimate width; 8 for Yelp, 32 elsewhere |
+| `--replay-budget R` | generated samples per client per round (default 192) |
+| `--max-per-cell N` | cap per (partition, class) cell — never a global sample, which destroys sparse cells |
+| `--min-per-cell N` | drop cells below N samples |
+| `--partitions P` | override the geo-partition count |
+| `--yelp-max-reviews N` | reviews streamed; use the whole file |
+| `--quick` | fewer rounds and clients, for checking plumbing |
+
+Method names: `no_replay`, `ewc`, `er`, `dgr`, `ac_gan`, `geo_cvae`
+(feature space), `geo_cvae_input` (input space), plus the `abl_*` arms.
+
+---
+
+## 6. Things that will bite you
+
+**Read `retention`, not just `seeds`.** Average accuracy conceals the result
+the paper is about. On all three datasets AA is close to a cell-count-weighted
+average of old- and new-class accuracy, so a model that abandons the old label
+space entirely and learns the new one well scores respectably. Backward
+transfer has the same problem in a different way: when forgetting is total it
+saturates, and three methods can report BWT identical to five decimal places
+while differing in nothing because all three are at the floor.
+
+**Caches are keyed, but not on everything.** The raw extraction is cached per
+dataset (plus input width and review cap for Yelp) and the subsampled view
+under its own key. Changing `--max-per-cell` does not force a re-extract;
+changing the data itself does, so pass `--rebuild` to `build_dataset.py` if you
+replace the source files.
+
+**Label leakage is easy here.** NYC classes are binned trip distance, so
+including distance, dropoff or duration as features makes the label a
+deterministic function of the input: 98.6% centralised accuracy instead of
+45.3%. The loader uses pre-trip observables only. Yelp's business attributes
+include category-naming keys, which are filtered for the same reason. If you
+add features, check the centralised ceiling first.
+
+**Use a fresh `--out`.** See §2.
+
+---
+
+## 7. Environment
+
+Tested on Python 3.11 and 3.13 with the versions in `requirements.txt`. CPU
+only; nothing here needs a GPU and nothing is written to use one. GeoLife's
+first extraction reads ~18k trajectory files and takes 10–30 minutes; NYC's
+12.7M-row parse takes a few minutes and is cached thereafter.
