@@ -37,11 +37,11 @@ python3 run.py --experiment all --seeds 5 \
 Then:
 
 ```bash
-python3 ../exp/analyze.py seeds     results/seeds.csv    --out tab_main.tex
-python3 ../exp/analyze.py cells     results/cells.csv    --out tab_sparse.tex
-python3 ../exp/analyze.py partition results/cells.csv    --out tab_part.tex
-python3 ../exp/analyze.py ablation  results/ablation.csv --out tab_abl.tex
-python3 ../exp/mia_eval.py          results/scores.csv   --out tab_mia.tex --flip recon_gap
+python3 analyze.py seeds     results/seeds.csv    --out tab_main.tex
+python3 analyze.py cells     results/cells.csv    --out tab_sparse.tex
+python3 analyze.py partition results/cells.csv    --out tab_part.tex
+python3 analyze.py ablation  results/ablation.csv --out tab_abl.tex
+python3 mia_eval.py          results/scores.csv   --out tab_mia.tex --flip recon_gap
 ```
 
 ## Hyperparameters
@@ -79,7 +79,7 @@ and rehearsed against (`end_stage`), which is DGR's scholar–student scheme. Th
 AC-GAN baseline gets the same treatment so the comparison is between generator
 families, not between one that rehearses and one that does not.
 
-**4. The no-geo ablation zeroes the embedding, it does not remove it.**
+**4. The no-geo ablation zeroes the embedding; it does not remove it.**
 `GeoCVAE.cond` substitutes a zero vector of the same width when
 `geo_cond=False`, so parameter count and input dimensions are unchanged.
 Dropping the columns would confound "no geo information" with "smaller model".
@@ -108,4 +108,4 @@ run.py       CLI
 
 On 2 CPU cores, one CG-IL run at 73 clients is roughly 1.5 s/round × 45 rounds
 ≈ 1 min. The full Tier-1 set at 5 seeds is a few hours. Real GeoLife will be
-slower in feature extraction (cached after the first load) but similar to train.
+slower in feature extraction (cached after the first load) but similar to training.
